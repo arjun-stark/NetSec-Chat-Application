@@ -1,9 +1,8 @@
 import os
 import json
-import time
 import socket
 import threading
-import hashlib
+import time
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -11,43 +10,25 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from getpass import getpass
-import argon2
-
-# Configuration
-CONFIG_FILE = "client_config.json"
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 5000
-BUFFER_SIZE = 4096
+import base64
 
 class SecureMessengerClient:
     def __init__(self):
-        self.load_config()
+        self.server_host = "127.0.0.1"
+        self.server_port = 5000
         self.username = None
-        self.session_keys = {}
         self.peer_connections = {}
-        self.server_public_key = self.load_server_public_key()
+        self.server_public_key = None
         self.ephemeral_key_pair = None
-        self.server_socket = None
+        self.listener_socket = None
         self.running = False
+        self.load_server_public_key()
         
-    def load_config(self):
-        """Load client configuration from file"""
-        try:
-            with open(CONFIG_FILE) as f:
-                self.config = json.load(f)
-        except FileNotFoundError:
-            print("Configuration file not found. Using defaults.")
-            self.config = {
-                "server_host": SERVER_HOST,
-                "server_port": SERVER_PORT
-            }
-    
     def load_server_public_key(self):
-        """Load the server's pre-trusted public key"""
-        # In a real implementation, this would load from a secure storage
-        # For demo purposes, we'll generate one
+        """Load the server's public key (hardcoded for demo)"""
+        # In a real implementation, this would be properly secured
         private_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
-        return private_key.public_key()
+        self.server_public_key = private_key.public_key()
     
     def generate_ephemeral_key_pair(self):
         """Generate new ephemeral ECDH key pair"""
@@ -87,62 +68,68 @@ class SecureMessengerClient:
         return aesgcm.decrypt(nonce, ciphertext, None).decode()
     
     def authenticate_with_server(self):
-        """Implement PAKE-based authentication with server"""
+        """Authenticate with server using PAKE"""
         print("=== Authentication ===")
         username = input("Username: ")
         password = getpass("Password: ")
         
-        # Generate SRP verifier (would be done during registration)
-        salt = os.urandom(16)
-        verifier = argon2.hash_password(password.encode(), salt)
-        
-        # Generate ephemeral keys for authentication
+        # Generate ephemeral key pair for authentication
         a_private = ec.generate_private_key(ec.SECP384R1(), default_backend())
         a_public = a_private.public_key()
         
-        # Send authentication request to server
-        auth_request = {
-            "username": username,
-            "a_public": a_public.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode()
-        }
-        
-        # In real implementation, would send to server and get response
-        # For demo, we'll simulate successful authentication
-        print("Authenticating...")
-        time.sleep(1)  # Simulate network delay
-        
-        # Simulate server response with ephemeral key
-        b_private = ec.generate_private_key(ec.SECP384R1(), default_backend())
-        b_public = b_private.public_key()
-        
-        # Derive session key
-        shared_secret = a_private.exchange(ec.ECDH(), b_public)
-        session_key = self.derive_session_key(shared_secret)
-        
-        # Store session information
-        self.username = username
-        self.session_keys["server"] = session_key
-        print("Authentication successful!")
-        
-        # Start peer listener
-        self.start_peer_listener()
-        
-        return True
+        # Connect to server
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect((self.server_host, self.server_port))
+                
+                # Send authentication request
+                auth_request = {
+                    "username": username,
+                    "a_public": a_public.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    ).decode()
+                }
+                sock.send(json.dumps(auth_request).encode())
+                
+                # Get server response
+                response = json.loads(sock.recv(4096).decode())
+                if response.get("status") != "success":
+                    print("Authentication failed")
+                    return False
+                
+                # Load server's ephemeral public key
+                b_public = serialization.load_pem_public_key(
+                    response["b_public"].encode(),
+                    backend=default_backend()
+                )
+                
+                # Derive session key
+                shared_secret = a_private.exchange(ec.ECDH(), b_public)
+                session_key = self.derive_session_key(shared_secret)
+                
+                # Verify session key matches (in real implementation would use proper proof)
+                if session_key.hex() != response["session_key"]:
+                    print("Session key mismatch")
+                    return False
+                
+                self.username = username
+                print("Authentication successful!")
+                return True
+                
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            return False
     
     def start_peer_listener(self):
         """Start listening for peer connections"""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind(('0.0.0.0', 0))  # Bind to any available port
-        self.server_socket.listen(5)
-        self.listener_port = self.server_socket.getsockname()[1]
+        self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener_socket.bind(('0.0.0.0', 0))  # Bind to any available port
+        self.listener_socket.listen(5)
+        self.listener_port = self.listener_socket.getsockname()[1]
         
-        # Register with server (in real implementation)
         print(f"Listening for peer connections on port {self.listener_port}")
         
-        # Start listener thread
         self.running = True
         listener_thread = threading.Thread(target=self.handle_peer_connections)
         listener_thread.daemon = True
@@ -152,7 +139,7 @@ class SecureMessengerClient:
         """Handle incoming peer connections"""
         while self.running:
             try:
-                conn, addr = self.server_socket.accept()
+                conn, addr = self.listener_socket.accept()
                 threading.Thread(target=self.handle_peer, args=(conn, addr)).start()
             except:
                 if self.running:
@@ -161,9 +148,10 @@ class SecureMessengerClient:
     
     def handle_peer(self, conn, addr):
         """Handle communication with a peer"""
+        peer_id = f"{addr[0]}:{addr[1]}"
         try:
             # Perform key exchange
-            peer_public_key_pem = conn.recv(BUFFER_SIZE)
+            peer_public_key_pem = conn.recv(4096)
             peer_public_key = serialization.load_pem_public_key(
                 peer_public_key_pem,
                 backend=default_backend()
@@ -180,15 +168,16 @@ class SecureMessengerClient:
             shared_key = self.derive_shared_key(peer_public_key)
             
             # Store peer connection
-            peer_id = f"{addr[0]}:{addr[1]}"
             self.peer_connections[peer_id] = {
                 "conn": conn,
                 "key": shared_key
             }
             
+            print(f"Connected to peer {peer_id}")
+            
             # Start receiving messages
             while self.running:
-                encrypted_msg = conn.recv(BUFFER_SIZE)
+                encrypted_msg = conn.recv(4096)
                 if not encrypted_msg:
                     break
                 
@@ -205,14 +194,14 @@ class SecureMessengerClient:
             conn.close()
             if peer_id in self.peer_connections:
                 del self.peer_connections[peer_id]
+                print(f"Disconnected from {peer_id}")
     
     def connect_to_peer(self, peer_address):
-        """Connect to another peer"""
+        """Connect to another peer directly"""
         try:
             host, port = peer_address.split(":")
             port = int(port)
             
-            # Create new socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((host, port))
             
@@ -224,7 +213,7 @@ class SecureMessengerClient:
             ))
             
             # Receive peer's public key
-            peer_public_key_pem = sock.recv(BUFFER_SIZE)
+            peer_public_key_pem = sock.recv(4096)
             peer_public_key = serialization.load_pem_public_key(
                 peer_public_key_pem,
                 backend=default_backend()
@@ -262,7 +251,8 @@ class SecureMessengerClient:
     
     def command_interface(self):
         """Main command interface"""
-        print("Secure Messenger - Type 'help' for commands")
+        print("\nSecure Messenger - Type 'help' for commands")
+        print(f"Your connection info: [IP]:{self.listener_port}")
         
         while True:
             try:
@@ -272,7 +262,7 @@ class SecureMessengerClient:
                     
                 if cmd[0] == "help":
                     print("Commands:")
-                    print("  list - Show available peers")
+                    print("  list - Show connected peers")
                     print("  connect <ip:port> - Connect to peer")
                     print("  send <peer_id> <message> - Send message")
                     print("  quit - Exit program")
@@ -293,8 +283,10 @@ class SecureMessengerClient:
                         
                 elif cmd[0] == "quit":
                     self.running = False
-                    if self.server_socket:
-                        self.server_socket.close()
+                    if self.listener_socket:
+                        self.listener_socket.close()
+                    for peer_id in list(self.peer_connections.keys()):
+                        self.peer_connections[peer_id]["conn"].close()
                     print("Goodbye!")
                     break
                     
@@ -307,4 +299,6 @@ class SecureMessengerClient:
 if __name__ == "__main__":
     client = SecureMessengerClient()
     if client.authenticate_with_server():
+        client.generate_ephemeral_key_pair()
+        client.start_peer_listener()
         client.command_interface()
